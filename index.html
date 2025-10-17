@@ -1,0 +1,272 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>Baker Bird (Mobile)</title>
+  <!-- iMessage / social preview -->
+    <meta property="og:title" content="Baker Bird" />
+    <meta property="og:description" content="Play the pixel adventure of Baker the cat!" />
+    <meta property="og:image" content="baker.png" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://yourdomain.com/" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <meta name="theme-color" content="#0c0f14" />
+  <link rel="preload" href="baker.png" as="image">
+  <style>
+    :root { --bg:#0c0f14; --fg:#ffffff; --accent:#01a982; --pipe:#ff9500; }
+    html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; }
+    body { overflow:hidden; touch-action:none; -webkit-user-select:none; user-select:none; }
+    #game { display:block; width:100vw; height:100vh; background:var(--bg); }
+    .hud {
+      position:fixed; top:8px; left:0; right:0; text-align:center;
+      font-weight:700; text-shadow:0 1px 2px rgba(0,0,0,.5); pointer-events:none;
+    }
+    .hud span { display:inline-block; margin:0 .25rem; }
+    .btn {
+      position:fixed; left:50%; transform:translateX(-50%);
+      bottom:10vh; background:var(--accent); color:#fff;
+      border:0; border-radius:16px; padding:12px 18px; font-weight:800; font-size:16px;
+      box-shadow:0 6px 18px rgba(1,169,130,.35); touch-action:manipulation;
+    }
+    .btn:active { transform:translateX(-50%) translateY(1px); }
+    .tips {
+      position:fixed; bottom:4vh; left:0; right:0; text-align:center; opacity:.7; font-size:12px;
+      pointer-events:none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="game"></canvas>
+  <div class="hud">
+    <span id="score">0</span>
+    <span>|</span>
+    <span>Best: <span id="best">0</span></span>
+  </div>
+  <button id="tap" class="btn" aria-label="Tap to jump">Tap</button>
+  <div class="tips" id="tips">Tap anywhere to flap · Avoid the pipes</div>
+
+  <script>
+  ;(()=> {
+    // ---------- Canvas ----------
+    const cvs = document.getElementById('game');
+    const ctx = cvs.getContext('2d', { alpha:false, desynchronized:true });
+    const DESIGN_W = 360, DESIGN_H = 640;
+
+    let dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 3));
+    let scale = 1, marginX = 0, marginY = 0;
+    function resize(){
+      dpr = Math.max(1, Math.min(window.devicePixelRatio || 1, 3));
+      const w = window.innerWidth, h = window.innerHeight;
+      cvs.width  = Math.floor(w * dpr);
+      cvs.height = Math.floor(h * dpr);
+      ctx.setTransform(dpr,0,0,dpr,0,0);
+      ctx.imageSmoothingEnabled = false;
+
+      scale = Math.min(w / DESIGN_W, h / DESIGN_H);
+      marginX = (w - DESIGN_W * scale) * 0.5;
+      marginY = (h - DESIGN_H * scale) * 0.5;
+      drawSplash();
+    }
+    window.addEventListener('resize', resize, { passive:true });
+
+    function withSceneTransform(drawFn){
+      ctx.save();
+      ctx.translate(marginX, marginY);
+      ctx.scale(scale, scale);
+      drawFn();
+      ctx.restore();
+    }
+
+    // ---------- Asset loading ----------
+    let playerImg = new Image();
+    let imgReady = false;
+    let useFallback = false;
+
+    const imgReadyPromise = new Promise((resolve) => {
+      playerImg.onload  = () => { imgReady = true; resolve(); };
+      playerImg.onerror = () => { useFallback = true; resolve(); };
+    });
+    playerImg.src = 'baker.png';
+
+    function drawPlayer(x, y, size){
+      if (imgReady && !useFallback) {
+        ctx.drawImage(playerImg, x - size/2, y - size/2, size, size);
+      } else if (useFallback) {
+        ctx.fillStyle = '#ffd54f';
+        ctx.fillRect(x - size/2, y - size/2, size, size);
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 2;
+        ctx.strokeRect(x - size/2, y - size/2, size, size);
+      } else {
+        // still loading, draw nothing (no flicker)
+      }
+    }
+
+    // ---------- Game state ----------
+    const state = { running:false, over:false, t:0, score:0, best: +localStorage.getItem('best_bakerbird')||0 };
+    const player = { x: DESIGN_W*0.3, y: DESIGN_H*0.5, vy:0, size: 36 };
+    const phys   = { gravity: 1400, jump: -380, maxVy: 900 };
+    let pipes = [];
+    const base = { speed: 120, gap: 160, spawnEvery: 1.4 };
+
+    const scoreEl = document.getElementById('score');
+    const bestEl  = document.getElementById('best');
+    const tapBtn  = document.getElementById('tap');
+    const tipsEl  = document.getElementById('tips');
+    bestEl.textContent = state.best;
+
+    // ---------- Input ----------
+    function flap(){
+      if (!state.running) startGame();
+      if (!state.over) player.vy = phys.jump;
+      else startGame();
+    }
+    ['touchstart','mousedown'].forEach(evt=>{
+      window.addEventListener(evt, (e)=>{ e.preventDefault(); flap(); }, { passive:false });
+    });
+    tapBtn.addEventListener('click', (e)=>{ e.preventDefault(); flap(); });
+    window.addEventListener('keydown', (e)=>{ if (e.code === 'Space' || e.code === 'ArrowUp') { e.preventDefault(); flap(); }});
+
+    // ---------- Loop ----------
+    let last = 0, spawnTimer = 0, speed = base.speed, gap = base.gap, spawnEvery = base.spawnEvery;
+    let rafId = 0;
+
+    function startGame(){
+      state.running = true; state.over = false; state.t = 0; state.score = 0;
+      scoreEl.textContent = '0';
+      tipsEl.textContent = ' ';
+      player.y = DESIGN_H*0.5; player.vy = 0; pipes = [];
+      speed = base.speed; gap = base.gap; spawnEvery = base.spawnEvery; spawnTimer = 0;
+      last = performance.now();
+      cancelAnimationFrame(rafId);
+      rafId = requestAnimationFrame(raf);
+    }
+
+    function raf(now=performance.now()){
+      const dt = Math.min((now - last)/1000, 0.033); last = now;
+      update(dt); draw();
+      if (!state.over) rafId = requestAnimationFrame(raf);
+    }
+
+    function update(dt){
+      state.t += dt;
+      speed = base.speed + Math.min(140, state.t * 8);
+      gap   = Math.max(100, base.gap - state.t * 2);
+      spawnEvery = Math.max(0.9, base.spawnEvery - state.t * 0.01);
+
+      player.vy = Math.min(phys.maxVy, player.vy + phys.gravity * dt);
+      player.y += player.vy * dt;
+
+      spawnTimer += dt;
+      if (spawnTimer >= spawnEvery) {
+        spawnTimer = 0;
+        const w = 56;
+        const safeTop = 100, safeBot = 100;
+        const gapY = safeTop + Math.random() * (DESIGN_H - safeTop - safeBot);
+        pipes.push({ x: DESIGN_W + w, w, gapY, passed:false });
+      }
+
+      for (const p of pipes) p.x -= speed * dt;
+      if (pipes.length && pipes[0].x + pipes[0].w < -10) pipes.shift();
+
+      for (const p of pipes) {
+        if (!p.passed && p.x + p.w < player.x) {
+          p.passed = true;
+          state.score++;
+          scoreEl.textContent = state.score;
+        }
+        const topRect = { x:p.x, y:0, w:p.w, h: p.gapY - gap/2 };
+        const botRect = { x:p.x, y:p.gapY + gap/2, w:p.w, h: DESIGN_H - (p.gapY + gap/2) };
+        if (circleRectHit(player.x, player.y, player.size/2, topRect) ||
+            circleRectHit(player.x, player.y, player.size/2, botRect)) {
+          gameOver();
+          return;
+        }
+      }
+      if (player.y < 0 || player.y > DESIGN_H) gameOver();
+    }
+
+    function circleRectHit(cx, cy, r, rect){
+      const nx = Math.max(rect.x, Math.min(cx, rect.x + rect.w));
+      const ny = Math.max(rect.y, Math.min(cy, rect.y + rect.h));
+      const dx = cx - nx, dy = cy - ny;
+      return (dx*dx + dy*dy) <= r*r;
+    }
+
+    function draw(){
+      ctx.clearRect(0, 0, cvs.width / dpr, cvs.height / dpr);
+      ctx.fillStyle = '#0a1320';
+      ctx.fillRect(0, 0, cvs.width / dpr, cvs.height / dpr);
+
+      withSceneTransform(() => {
+        ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--pipe').trim() || '#ff9500';
+        for (const p of pipes) {
+          ctx.fillRect(p.x, 0, p.w, Math.max(0, p.gapY - gap/2));
+          const by = p.gapY + gap/2;
+          ctx.fillRect(p.x, by, p.w, Math.max(0, DESIGN_H - by));
+        }
+        drawPlayer(player.x, player.y, player.size);
+
+        if (state.over) {
+          ctx.fillStyle = 'rgba(0,0,0,0.5)';
+          ctx.fillRect(0,0,DESIGN_W,DESIGN_H);
+          ctx.fillStyle = '#fff';
+          ctx.textAlign = 'center';
+          ctx.font = '700 24px system-ui, -apple-system, Segoe UI, Roboto';
+          ctx.fillText('Game Over', DESIGN_W/2, DESIGN_H/2 - 10);
+          ctx.font = '700 16px system-ui, -apple-system, Segoe UI, Roboto';
+          ctx.fillText('Tap to retry', DESIGN_W/2, DESIGN_H/2 + 18);
+        }
+      });
+    }
+
+    function drawSplash(){
+      ctx.clearRect(0, 0, cvs.width / dpr, cvs.height / dpr);
+      ctx.fillStyle = '#0f1320';
+      ctx.fillRect(0,0,cvs.width / dpr, cvs.height / dpr);
+      withSceneTransform(() => {
+        ctx.fillStyle = '#fff';
+        ctx.textAlign = 'center';
+        ctx.font = '800 22px system-ui, -apple-system, Segoe UI, Roboto';
+        ctx.fillText('Baker Bird', DESIGN_W/2, DESIGN_H*0.35);
+        ctx.font = '600 14px system-ui, -apple-system, Segoe UI, Roboto';
+        ctx.fillText('Tap to start · Tap to flap', DESIGN_W/2, DESIGN_H*0.35 + 26);
+        drawPlayer(DESIGN_W*0.3, DESIGN_H*0.55, player.size);
+      });
+    }
+
+    function gameOver(){
+      state.over = true;
+      state.running = false;
+      if (state.score > state.best) {
+        state.best = state.score;
+        localStorage.setItem('best_bakerbird', state.best);
+      }
+      bestEl.textContent = state.best;
+      draw();
+      tipsEl.textContent = 'Tap anywhere to retry';
+    }
+
+    document.addEventListener('visibilitychange', ()=>{
+      if (document.hidden) {
+        if (!state.over) state.running = false;
+        cancelAnimationFrame(rafId);
+      } else {
+        if (!state.over && !state.running) {
+          state.running = true;
+          last = performance.now();
+          rafId = requestAnimationFrame(raf);
+        } else draw();
+      }
+    });
+
+    imgReadyPromise.then(() => {
+      resize();
+      drawSplash();
+    });
+  })();
+  </script>
+</body>
+</html>
